@@ -4,14 +4,14 @@ set -euo pipefail
 export PYTHONPATH=.
 
 if [[ "${RUN_MIGRATIONS:-1}" == "1" ]]; then
-  if [[ -n "${DATABASE_URL:-}" ]]; then
+  if [[ -n "${DATABASE_URL_PSQL:-}" ]]; then
     echo "Applying SQL migrations..."
     for f in migrations/*.sql; do
       echo "Running $f..."
-      psql "$DATABASE_URL" -f "$f"
+      psql "$DATABASE_URL_PSQL" -f "$f"
     done
   else
-    echo "DATABASE_URL not set; skipping migrations."
+    echo "DATABASE_URL_PSQL not set; skipping migrations."
   fi
 fi
 
