@@ -1,4 +1,3 @@
--- Seed the default plans
 INSERT INTO plans (id, lane, max_input_minutes, target_multiplier, credit_multiplier)
 VALUES
   ('express', 0, 20, 0.5, 1.5),
