@@ -58,6 +58,12 @@ async def run_compliance_scan(session: AsyncSession, platform: Platform, payload
             if need_kw and disclosure_text:
                 text_all = " ".join(t for _, t in blobs).lower()
                 if any(kw.lower() in text_all for kw in need_kw) and disclosure_text.lower() not in text_all:
-                    violations.append({"type":"MissingDisclosure","severity":"medium","requires": disclosure_text,"where":"global","suggest": f"Add: “{disclosure_text}”.")})
+                    violations.append({
+                        "type": "MissingDisclosure",
+                        "severity": "medium",
+                        "requires": disclosure_text,
+                        "where": "global",
+                        "suggest": f"Add: \"{disclosure_text}\"."
+                    })
     score = max(0, 100 - (len([v for v in violations if v["severity"]=="high"])*25 + len(violations)*5))
     return {"violations": violations, "suggestions": suggestions, "score": score}
