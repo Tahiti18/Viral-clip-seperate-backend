@@ -2,7 +2,8 @@ BEGIN;
 
 CREATE TABLE IF NOT EXISTS experiments (
     id TEXT PRIMARY KEY,
-    job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    -- link to jobs, but only if jobs exists
+    job_id TEXT REFERENCES jobs(id) ON DELETE CASCADE,
     variant_name TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -24,7 +25,7 @@ CREATE TABLE IF NOT EXISTS variant_stats (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Helpful indexes
+-- Indexes
 CREATE INDEX IF NOT EXISTS idx_experiments_job_id    ON experiments(job_id);
 CREATE INDEX IF NOT EXISTS idx_variants_experiment   ON variants(experiment_id);
 CREATE INDEX IF NOT EXISTS idx_variant_stats_variant ON variant_stats(variant_id);
