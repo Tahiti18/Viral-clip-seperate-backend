@@ -1,18 +1,4 @@
 #!/usr/bin/env bash
-set -euo pipefail
-
-export PYTHONPATH=.
-
-if [[ "${RUN_MIGRATIONS:-1}" == "1" ]]; then
-  if [[ -n "${DATABASE_URL_PSQL:-}" ]]; then
-    echo "Applying SQL migrations..."
-    for f in migrations/*.sql; do
-      echo "Running $f..."
-      psql "$DATABASE_URL_PSQL" -f "$f"
-    done
-  else
-    echo "DATABASE_URL_PSQL not set; skipping migrations."
-  fi
-fi
-
-exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}
+set -e
+PORT="${PORT:-8080}"
+exec uvicorn main:app --host 0.0.0.0 --port "$PORT"
