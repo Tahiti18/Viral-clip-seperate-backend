@@ -1,17 +1,32 @@
-CREATE TABLE experiments (
+BEGIN;
+
+CREATE TABLE IF NOT EXISTS experiments (
     id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
+    job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    variant_name TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-CREATE TABLE variants (
+
+CREATE TABLE IF NOT EXISTS variants (
     id TEXT PRIMARY KEY,
     experiment_id TEXT NOT NULL REFERENCES experiments(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
-    weight FLOAT NOT NULL DEFAULT 1.0
+    status TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-CREATE TABLE variant_stats (
+
+CREATE TABLE IF NOT EXISTS variant_stats (
+    id BIGSERIAL PRIMARY KEY,
     variant_id TEXT NOT NULL REFERENCES variants(id) ON DELETE CASCADE,
-    impressions INT NOT NULL DEFAULT 0,
-    conversions INT NOT NULL DEFAULT 0,
-    PRIMARY KEY (variant_id)
+    impressions INT DEFAULT 0,
+    clicks INT DEFAULT 0,
+    conversions INT DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Helpful indexes
+CREATE INDEX IF NOT EXISTS idx_experiments_job_id    ON experiments(job_id);
+CREATE INDEX IF NOT EXISTS idx_variants_experiment   ON variants(experiment_id);
+CREATE INDEX IF NOT EXISTS idx_variant_stats_variant ON variant_stats(variant_id);
+
+COMMIT;
