@@ -1,3 +1,5 @@
-[build] builder = "NIXPACKS"
-[deploy] startCommand = "bash run.sh"
-[env] RUN_MIGRATIONS = "1"
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "bash run.sh"
