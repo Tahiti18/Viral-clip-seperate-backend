@@ -1,15 +1,13 @@
-import os, json, io, zipfile
+import os, json, io, zipfile, urllib.request, urllib.error
 from typing import Optional, Any, Dict
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 import asyncpg
 from pydantic import BaseModel, Field
-import urllib.request
 
-app = FastAPI(title="UnityLab Backend", version="1.0.0")
+app = FastAPI(title="UnityLab Backend", version="1.0.1")
 
-# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://clipgenius.netlify.app", "http://localhost:3000"],
@@ -34,12 +32,10 @@ async def _pool():
     return app.state.pool
 
 @app.get("/")
-async def root(): 
-    return {"ok": True}
+async def root(): return {"ok": True}
 
 @app.get("/health")
-async def health(): 
-    return {"ok": True}
+async def health(): return {"ok": True}
 
 def _sample_srt() -> str:
     return (
@@ -57,10 +53,7 @@ async def handoff_zip():
     return StreamingResponse(
         buf,
         media_type="application/zip",
-        headers={
-            "Content-Disposition": 'attachment; filename="handoff.zip"',
-            "Cache-Control": "no-store",
-        },
+        headers={"Content-Disposition": 'attachment; filename="handoff.zip"', "Cache-Control": "no-store"},
     )
 
 class TemplateIn(BaseModel):
@@ -106,15 +99,13 @@ async def update_template(tid: str, body: Dict[str, Any]):
             sets.append(f"{k} = ${i}")
             vals.append(json.dumps(v) if k.endswith("_json") and isinstance(v,(dict,list)) else v)
             i += 1
-    if not sets: 
-        raise HTTPException(400, "No valid fields")
+    if not sets: raise HTTPException(400, "No valid fields")
     pool = await _pool()
     row = await pool.fetchrow(
         f"UPDATE templates SET {', '.join(sets)} WHERE id = ${i} RETURNING id, org_id, name, aspect, layers_json, caption_style_json, created_at",
         *vals, tid
     )
-    if not row: 
-        raise HTTPException(404, "Not found")
+    if not row: raise HTTPException(404, "Not found")
     return dict(row)
 
 @app.delete("/api/templates/{tid}")
@@ -155,8 +146,7 @@ async def list_renders():
 async def get_render(rid: str):
     pool = await _pool()
     row = await pool.fetchrow("SELECT id, timeline_id, status, progress, created_at FROM renders WHERE id=$1", rid)
-    if not row: 
-        raise HTTPException(404, "Not found")
+    if not row: raise HTTPException(404, "Not found")
     return dict(row)
 
 @app.get("/api/media")
@@ -171,7 +161,8 @@ async def list_projects():
     rows = await pool.fetch("SELECT id, org_id, title, description, created_at FROM projects ORDER BY created_at DESC")
     return [dict(r) for r in rows]
 
-# AI Status Check
+# ---------- AI status + analysis ----------
+
 @app.get("/api/ai-status")
 def ai_status_check():
     try:
@@ -183,82 +174,85 @@ def ai_status_check():
     except Exception as e:
         return {"ai_status": "offline", "error": str(e)}
 
+# NEW: direct OpenRouter key test (no prompts, no model) — returns 200 if key is valid
+@app.get("/api/_debug/openrouter")
+def debug_openrouter():
+    key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    if not key:
+        return {"ok": False, "error": "OPENROUTER_API_KEY missing"}
+    req = urllib.request.Request(
+        "https://openrouter.ai/api/v1/models",
+        headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            sample = r.read().decode("utf-8")[:500]
+            return {"ok": True, "status": r.status, "content_type": r.headers.get("content-type"), "sample": sample}
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8")[:500]
+        return {"ok": False, "status": e.code, "error_body": body}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 @app.post("/api/analyze-video")
 async def analyze_video(request: dict):
     try:
         api_key = os.getenv("OPENROUTER_API_KEY")
         if not api_key:
             return {"error": "API key missing", "success": False}
-        
+
         video_url = request.get("video_url", "")
         title = request.get("title", "")
         description = request.get("description", "")
-        
         if not video_url:
             return {"error": "Video URL required", "success": False}
-        
+
         prompt = f"""
         Analyze this video for viral clip potential:
         URL: {video_url}
         Title: {title}
         Description: {description}
-        
+
         Return exactly 3 viral clips in this JSON format:
         {{
           "clips": [
-            {{
-              "id": 1,
-              "start_time": "00:01:30",
-              "end_time": "00:02:15", 
-              "duration": 45,
-              "viral_score": 8.5,
-              "hook": "Attention-grabbing moment",
-              "reason": "Why this will go viral",
-              "platforms": ["TikTok", "Instagram"],
-              "predicted_views": 45000
-            }}
+            {{"id": 1, "start_time": "00:01:30", "end_time": "00:02:15", "duration": 45,
+              "viral_score": 8.5, "hook": "Attention-grabbing moment", "reason": "Why this will go viral",
+              "platforms": ["TikTok", "Instagram"], "predicted_views": 45000}}
           ]
         }}
         """
 
         data = {
-            "model": "openai/gpt-5-mini",  # safer fallback model
+            "model": "openai/gpt-5-mini",
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": 1500
         }
 
-        req_data = json.dumps(data).encode('utf-8')
-        request_obj = urllib.request.Request(
-            'https://openrouter.ai/api/v1/chat/completions',
+        req_data = json.dumps(data).encode("utf-8")
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/chat/completions",
             data=req_data,
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         )
 
-        with urllib.request.urlopen(request_obj, timeout=30) as response:
-            result = json.loads(response.read().decode('utf-8'))
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
 
-        ai_content = result['choices'][0]['message']['content']
-
+        ai_content = result["choices"][0]["message"]["content"]
         try:
-            start_idx = ai_content.find('{')
-            end_idx = ai_content.rfind('}') + 1
+            start_idx = ai_content.find("{")
+            end_idx = ai_content.rfind("}") + 1
             json_str = ai_content[start_idx:end_idx]
             parsed_clips = json.loads(json_str)
             clips = parsed_clips.get("clips", [])
         except:
-            clips = [
-                {
-                    "id": 1,
-                    "start_time": "00:01:30", 
-                    "end_time": "00:02:15",
-                    "duration": 45,
-                    "viral_score": 8.5,
-                    "hook": "AI-generated viral moment",
-                    "reason": "Strong engagement potential",
-                    "platforms": ["TikTok", "Instagram"],
-                    "predicted_views": 45000
-                }
-            ]
+            clips = [{
+                "id": 1, "start_time": "00:01:30", "end_time": "00:02:15", "duration": 45,
+                "viral_score": 8.5, "hook": "AI-generated viral moment",
+                "reason": "Strong engagement potential", "platforms": ["TikTok", "Instagram"],
+                "predicted_views": 45000
+            }]
 
         return {
             "success": True,
@@ -269,6 +263,5 @@ async def analyze_video(request: dict):
             "demo_mode": False,
             "clips_suggested": len(clips)
         }
-        
     except Exception as e:
         return {"error": f"Analysis failed: {str(e)}", "success": False}
