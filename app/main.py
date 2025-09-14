@@ -6,8 +6,9 @@ from fastapi.responses import StreamingResponse
 import asyncpg
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="UnityLab Backend", version="1.0.1")
+app = FastAPI(title="UnityLab Backend", version="1.0.2")
 
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://clipgenius.netlify.app", "http://localhost:3000"],
@@ -16,6 +17,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------- DB helpers ----------
 def _conn_strings():
     dpsql = os.getenv("DATABASE_URL_PSQL", "")
     dasync = os.getenv("DATABASE_URL", "")
@@ -31,6 +33,7 @@ async def _pool():
         app.state.pool = await asyncpg.create_pool(dpsql, min_size=1, max_size=5)
     return app.state.pool
 
+# ---------- Basics ----------
 @app.get("/")
 async def root(): return {"ok": True}
 
@@ -56,6 +59,7 @@ async def handoff_zip():
         headers={"Content-Disposition": 'attachment; filename="handoff.zip"', "Cache-Control": "no-store"},
     )
 
+# ---------- Schemas ----------
 class TemplateIn(BaseModel):
     name: str
     aspect: str = Field(pattern=r"^(9:16|1:1|16:9)$")
@@ -69,6 +73,7 @@ class JobIn(BaseModel):
     input_minutes: int = 5
     plan_id: str = "starter"
 
+# ---------- Template endpoints ----------
 @app.get("/api/templates")
 async def list_templates():
     pool = await _pool()
@@ -110,10 +115,11 @@ async def update_template(tid: str, body: Dict[str, Any]):
 
 @app.delete("/api/templates/{tid}")
 async def delete_template(tid: str):
-    pool = await _pool()
+    pool = await __pool()
     await pool.execute("DELETE FROM templates WHERE id=$1", tid)
     return {"ok": True}
 
+# ---------- Jobs / Media / Projects ----------
 @app.get("/api/jobs")
 async def list_jobs():
     pool = await _pool()
@@ -161,8 +167,7 @@ async def list_projects():
     rows = await pool.fetch("SELECT id, org_id, title, description, created_at FROM projects ORDER BY created_at DESC")
     return [dict(r) for r in rows]
 
-# ---------- AI status + analysis ----------
-
+# ---------- AI status + debug ----------
 @app.get("/api/ai-status")
 def ai_status_check():
     try:
@@ -174,7 +179,6 @@ def ai_status_check():
     except Exception as e:
         return {"ai_status": "offline", "error": str(e)}
 
-# NEW: direct OpenRouter key test (no prompts, no model) — returns 200 if key is valid
 @app.get("/api/_debug/openrouter")
 def debug_openrouter():
     key = os.getenv("OPENROUTER_API_KEY", "").strip()
@@ -194,6 +198,7 @@ def debug_openrouter():
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+# ---------- Analyze ----------
 @app.post("/api/analyze-video")
 async def analyze_video(request: dict):
     try:
@@ -224,9 +229,9 @@ async def analyze_video(request: dict):
         """
 
         data = {
-            "model": "openai/gpt-5-mini",
+            "model": "openai/gpt-4o-mini",
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 1500
+            "max_tokens": 500
         }
 
         req_data = json.dumps(data).encode("utf-8")
@@ -236,17 +241,20 @@ async def analyze_video(request: dict):
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         )
 
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8")[:500]
+            return {"success": False, "error": f"OpenRouter error {e.code}", "details": body}
 
         ai_content = result["choices"][0]["message"]["content"]
         try:
             start_idx = ai_content.find("{")
             end_idx = ai_content.rfind("}") + 1
-            json_str = ai_content[start_idx:end_idx]
-            parsed_clips = json.loads(json_str)
-            clips = parsed_clips.get("clips", [])
-        except:
+            parsed = json.loads(ai_content[start_idx:end_idx])
+            clips = parsed.get("clips", [])
+        except Exception:
             clips = [{
                 "id": 1, "start_time": "00:01:30", "end_time": "00:02:15", "duration": 45,
                 "viral_score": 8.5, "hook": "AI-generated viral moment",
@@ -258,7 +266,7 @@ async def analyze_video(request: dict):
             "success": True,
             "video_url": video_url,
             "clips": clips,
-            "ai_model": "openai/gpt-5-mini",
+            "ai_model": "openai/gpt-4o-mini",
             "processing_time": "Real AI Analysis",
             "demo_mode": False,
             "clips_suggested": len(clips)
