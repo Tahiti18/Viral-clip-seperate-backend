@@ -87,7 +87,7 @@ async def analyze_video(job: JobIn):
         Task: Break down this video into candidate viral clip spans.
         Return JSON with `clips` containing start_time, end_time, duration, and rough topic.
         """
-        gemini_out = _call_openrouter("google/gemini-1.5-pro-latest", gemini_prompt, api_key)
+        gemini_out = _call_openrouter("google/gemini-2.5-pro", gemini_prompt, api_key)
         
         # --- 2. Claude: extract emotional hooks ---
         claude_prompt = f"""
@@ -139,9 +139,9 @@ async def analyze_video(job: JobIn):
             "video_url": job.video_url,
             "clips": clips,
             "agents": {
-                "A": "openai/gpt-5",
+                "A": "google/gemini-2.5-pro",
                 "B": "anthropic/claude-3.5-sonnet",
-                "C": "google/gemini-1.5-pro-latest",
+                "C": "openai/gpt-5",
                 "D": "openai/gpt-4.1"
             }
         }
