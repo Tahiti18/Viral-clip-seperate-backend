@@ -1,284 +1,159 @@
-import os, json, io, zipfile, urllib.request, urllib.error, time, re
-from typing import Dict, Any, Optional, List, Tuple
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-import asyncpg
-from pydantic import BaseModel
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>ClipGenius – Live Clip Preview</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; padding: 24px; background: #0b0c10; color: #e5e7eb; }
+    .card { max-width: 900px; margin: 0 auto; background: #111318; border: 1px solid #1f2430; border-radius: 14px; padding: 20px; }
+    h1 { margin: 0 0 12px; font-size: 28px; color: #7dd3fc; }
+    .row { display: flex; gap: 8px; margin: 14px 0 8px; }
+    input[type=text] { flex: 1; padding: 12px 14px; border-radius: 10px; border: 1px solid #2a3140; background: #0f1218; color: #e5e7eb; outline: none; }
+    button { padding: 12px 14px; border-radius: 10px; border: 0; background: #22c55e; color: #061018; font-weight: 700; cursor: pointer; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .meta { opacity: 0.85; margin: 8px 0 14px; }
+    iframe, video { width: 100%; aspect-ratio: 16/9; background: #000; border-radius: 12px; border: 1px solid #1f2430; }
+    pre { background: #0f1218; border: 1px solid #1f2430; color: #cbd5e1; padding: 10px; border-radius: 10px; overflow: auto; }
+    .error { color: #fda4af; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>ClipGenius — Live Clip Preview</h1>
+    <div>Paste a YouTube link or a direct MP4 URL. We’ll analyze and preview the strongest segment.</div>
 
-app = FastAPI(title="UnityLab Backend", version="2.3.2-multiagent-3clips-nodemo")
+    <div class="row">
+      <input id="videoUrl" type="text" placeholder="https://www.youtube.com/watch?v=..." />
+      <button id="goBtn" onclick="loadClip()">Analyze & Preview</button>
+    </div>
 
-# ---------------- CORS ----------------
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["https://clipgenius.netlify.app", "http://localhost:3000"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+    <div id="status" class="meta"></div>
+    <div id="preview"></div>
+  </div>
 
-# ---------------- DB helpers ----------------
-def _conn_strings():
-    dpsql = os.getenv("DATABASE_URL_PSQL", "")
-    dasync = os.getenv("DATABASE_URL", "")
-    if not dpsql and dasync.startswith("postgresql+asyncpg://"):
-        dpsql = "postgresql://" + dasync.split("postgresql+asyncpg://", 1)[1]
-    return dpsql, dasync
+  <script>
+    // ---- CONFIG ----
+    const BACKEND = "https://viral-clip-seperate-backend-production.up.railway.app";
 
-async def _pool():
-    if not hasattr(app.state, "pool"):
-        dpsql, _ = _conn_strings()
-        if not dpsql:
-            raise HTTPException(status_code=500, detail="DATABASE_URL_PSQL or DATABASE_URL not set")
-        app.state.pool = await asyncpg.create_pool(dpsql, min_size=1, max_size=5)
-    return app.state.pool
-
-# ---------------- Schemas ----------------
-class JobIn(BaseModel):
-    video_url: str
-    title: str
-    description: str
-
-# ---------------- OpenRouter JSON-forced helpers ----------------
-JSON_ONLY_SYSTEM = (
-    "Return ONLY valid JSON. No prose, no markdown, no code fences. "
-    "Follow the schema exactly. If you cannot, return {\"clips\":[]}."
-)
-
-FENCE_RE = re.compile(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", re.IGNORECASE)
-
-def _extract_json_str(text: str) -> Optional[str]:
-    if not text:
-        return None
-    m = FENCE_RE.search(text)
-    if m:
-        return m.group(1).strip()
-    a = text.find("{")
-    b = text.rfind("}")
-    if a != -1 and b != -1 and b > a:
-        return text[a:b+1].strip()
-    return None
-
-def _openrouter_request(payload: Dict[str, Any]) -> Dict[str, Any]:
-    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("Missing OPENROUTER_API_KEY")
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": os.getenv("OPENROUTER_HTTP_REFERER", "https://clipgenius.netlify.app"),
-        "X-Title": os.getenv("OPENROUTER_APP_TITLE", "ClipGenius"),
+    // ---- UTIL ----
+    function hmsToSeconds(hms) {
+      const [hh="0", mm="0", ss="0"] = String(hms || "0:0:0").split(":");
+      return (+hh)*3600 + (+mm)*60 + (+ss);
     }
-    req = urllib.request.Request(
-        "https://openrouter.ai/api/v1/chat/completions",
-        data=json.dumps(payload).encode("utf-8"),
-        headers=headers,
-    )
-    with urllib.request.urlopen(req, timeout=90) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-def _ask_json(model: str, user_prompt: str, schema_hint: str, attempts: int = 2, max_tokens: int = 1200) -> Dict[str, Any]:
-    last_text = ""
-    for _ in range(attempts):
-        payload = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": JSON_ONLY_SYSTEM + " Schema: " + schema_hint},
-                {"role": "user", "content": user_prompt},
-            ],
-            "max_tokens": max_tokens,
-            "temperature": 0.2,
-            "response_format": {"type": "json_object"},
-            "seed": 1
-        }
-        data = _openrouter_request(payload)
-        text = data["choices"][0]["message"]["content"]
-        last_text = text
-
-        js = _extract_json_str(text)
-        if js:
-            try:
-                obj = json.loads(js)
-                if isinstance(obj, dict) and isinstance(obj.get("clips"), list):
-                    return {"clips": obj["clips"], "raw": text[:1000]}
-                if isinstance(obj, list):
-                    return {"clips": obj, "raw": text[:1000]}
-            except Exception:
-                pass
-
-        user_prompt = (
-            "The previous response was NOT valid JSON.\n"
-            "Respond again with ONLY valid JSON that matches this schema: "
-            f"{schema_hint}\n\n"
-            "Your previous output (truncated):\n" + last_text[:1000]
-        )
-        time.sleep(0.4)
-    return {"clips": [], "raw": last_text[:1000]}
-
-# ---------------- Clip utilities ----------------
-def _hms_to_seconds(hms: str) -> int:
-    try:
-        hh, mm, ss = (hms or "00:00:00").split(":")
-        return int(hh) * 3600 + int(mm) * 60 + int(ss)
-    except Exception:
-        return 0
-
-def _normalize_clip(c: Dict[str, Any], idx: int) -> Dict[str, Any]:
-    st = c.get("start_time") or "00:00:00"
-    et = c.get("end_time") or "00:00:10"
-    dur = c.get("duration")
-    if not isinstance(dur, int):
-        dur = max(1, _hms_to_seconds(et) - _hms_to_seconds(st))
-    return {
-        "id": int(c.get("id") or (idx + 1)),
-        "start_time": st,
-        "end_time": et,
-        "duration": dur,
-        "viral_score": float(c.get("viral_score") or 0),
-        "hook": c.get("hook") or "",
-        "reason": c.get("reason") or "",
-        "title": c.get("title") or "",
-        "caption": c.get("caption") or "",
-        "platforms": c.get("platforms") or [],
-        "predicted_views": int(c.get("predicted_views") or 0),
+    function isYouTube(url) {
+      return /(?:youtube\.com|youtu\.be)/i.test(url);
+    }
+    function getYouTubeId(url) {
+      const m = url.match(/[?&]v=([^&#]+)/) || url.match(/youtu\.be\/([^?&#]+)/);
+      return m ? m[1] : null;
     }
 
-def _dedupe_by_times(clips: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    seen: set[Tuple[str,str]] = set()
-    out = []
-    for c in clips:
-        key = (c.get("start_time"), c.get("end_time"))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(c)
-    return out
+    // ---- MAIN ----
+    async function loadClip() {
+      const urlInput = document.getElementById('videoUrl');
+      const goBtn = document.getElementById('goBtn');
+      const statusEl = document.getElementById('status');
+      const previewEl = document.getElementById('preview');
+      const url = urlInput.value.trim();
 
-def _enforce_three(best: List[Dict[str,Any]], fallbacks: List[List[Dict[str,Any]]]) -> List[Dict[str,Any]]:
-    merged: List[Dict[str,Any]] = [_normalize_clip(c,i) for i,c in enumerate(best)]
-    for fb in fallbacks:
-        for c in fb:
-            merged.append(_normalize_clip(c, len(merged)))
-    merged = _dedupe_by_times(merged)
-    merged.sort(key=lambda c: float(c.get("viral_score") or 0), reverse=True)
-    return merged[:3]
+      previewEl.innerHTML = "";
+      statusEl.textContent = "";
+      if (!url) { statusEl.innerHTML = '<span class="error">Paste a video URL.</span>'; return; }
 
-# ---------------- Routes ----------------
-@app.get("/")
-async def root():
-    return {"ok": True}
+      goBtn.disabled = true;
+      statusEl.textContent = "Analyzing…";
 
-@app.get("/health")
-async def health():
-    return {"ok": True}
+      try {
+        const resp = await fetch(`${BACKEND}/api/analyze-video`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            video_url: url,
+            title: "ClipGenius Preview",
+            description: "Live preview from index.html"
+          })
+        });
+        const data = await resp.json();
 
-@app.get("/api/ai-status")
-def ai_status_check():
-    key = os.getenv("OPENROUTER_API_KEY", "")
-    return {
-        "ai_status": "online",
-        "api_key_valid": bool(key and key.startswith("sk-or-")),
-        "model_default": os.getenv("FINAL_JUDGE_MODEL", "openai/gpt-5")
-    }
-
-# ---------------- Multi-agent pipeline ----------------
-@app.post("/api/analyze-video")
-async def analyze_video(job: JobIn):
-    try:
-        # 1) Gemini
-        schema1 = '{"clips":[{"start_time":"HH:MM:SS","end_time":"HH:MM:SS","duration":45,"topic":"..."}]}'
-        gemini_prompt = f"""Video URL: {job.video_url}
-Title: {job.title}
-Description: {job.description}
-
-Task: propose candidate viral clip spans.
-Return ONLY JSON matching: {schema1}
-"""
-        g = _ask_json("google/gemini-2.5-pro", gemini_prompt, schema1)
-
-        # 2) Claude
-        schema2 = '{"clips":[{"start_time":"HH:MM:SS","end_time":"HH:MM:SS","duration":45,"topic":"...","hook":"...","reason":"..."}]}'
-        claude_prompt = f"""Given this:
-{json.dumps({"clips": g["clips"]}, ensure_ascii=False)}
-
-For each clip, add "hook" and "reason".
-Return ONLY JSON matching: {schema2}
-"""
-        c = _ask_json("anthropic/claude-3.5-sonnet", claude_prompt, schema2)
-
-        # 3) Judge (GPT-5 fallback GPT-4.1)
-        schema3 = '{"clips":[{"id":1,"start_time":"HH:MM:SS","end_time":"HH:MM:SS","duration":45,"viral_score":8.7,"hook":"...","reason":"..."}]}'
-        judge_model = os.getenv("FINAL_JUDGE_MODEL", "openai/gpt-5") or "openai/gpt-5"
-        judge_prompt = f"""Review these clips and return the BEST three with improved hook/reason and a "viral_score" 0–10.
-Input:
-{json.dumps({"clips": c["clips"]}, ensure_ascii=False)}
-
-Return ONLY JSON matching: {schema3}
-"""
-        try:
-            j = _ask_json(judge_model, judge_prompt, schema3)
-            used_judge = judge_model
-            if not j["clips"]:
-                raise RuntimeError("empty judge result")
-        except Exception:
-            j = _ask_json("openai/gpt-4.1", judge_prompt, schema3)
-            used_judge = "openai/gpt-4.1"
-
-        final3 = _enforce_three(j["clips"], [c["clips"], g["clips"]])
-
-        # 4) Packager (GPT-4.1)
-        schema4 = '{"clips":[{"id":1,"start_time":"HH:MM:SS","end_time":"HH:MM:SS","duration":45,"viral_score":8.7,"hook":"...","reason":"...","title":"...","caption":"...","platforms":["TikTok","Instagram"],"predicted_views":45000}]}'
-        pack_prompt = f"""Enhance these with title, caption, platforms, predicted_views.
-Input:
-{json.dumps({"clips": final3}, ensure_ascii=False)}
-
-Return ONLY JSON matching: {schema4}
-"""
-        p = _ask_json("openai/gpt-4.1", pack_prompt, schema4)
-        packaged = _enforce_three(p["clips"], [final3])
-
-        for i, clip in enumerate(packaged, start=1):
-            clip["id"] = i
-
-        return {
-            "success": True,
-            "video_url": job.video_url,
-            "clips": packaged,
-            "agents": {
-                "A": "google/gemini-2.5-pro",
-                "B": "anthropic/claude-3.5-sonnet",
-                "C": used_judge,
-                "D": "openai/gpt-4.1",
-            },
-            "demo": False,                 # ensure UI doesn’t flag demo
-            "analysis_mode": "live"        # force live mode
+        if (!resp.ok || !data || data.success === false) {
+          const err = (data && (data.error || data.details)) || resp.statusText || "Unknown error";
+          statusEl.innerHTML = `<span class="error">Error: ${err}</span>`;
+          goBtn.disabled = false;
+          return;
         }
 
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8") if hasattr(e, "read") else str(e)
-        return {"success": False, "error": f"HTTP Error {e.code}", "details": detail}
-    except Exception as e:
-        return {"success": False, "error": f"Pipeline failed: {str(e)}"}
+        if (!data.clips || data.clips.length === 0) {
+          statusEl.innerHTML = '<span class="error">No clips returned.</span>';
+          goBtn.disabled = false;
+          return;
+        }
 
-# ---------------- Optional handoff ZIP ----------------
-def _sample_srt() -> str:
-    return (
-        "1\n00:00:00,000 --> 00:00:02,000\nWelcome to UnityLab!\n\n"
-        "2\n00:00:02,000 --> 00:00:04,500\nThis is a sample SRT from the backend.\n\n"
-    )
+        // Show the strongest available clip (first in list)
+        const clip = data.clips[0];
+        const start = hmsToSeconds(clip.start_time || "00:00:00");
+        const end   = hmsToSeconds(clip.end_time   || "00:00:10");
 
-@app.get("/api/handoff.zip")
-async def handoff_zip():
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("README.txt", "UnityLab editor handoff")
-        zf.writestr("captions.srt", _sample_srt())
-    buf.seek(0)
-    return StreamingResponse(
-        buf,
-        media_type="application/zip",
-        headers={
-            "Content-Disposition": 'attachment; filename="handoff.zip"',
-            "Cache-Control": "no-store",
-        },
-    )
+        statusEl.textContent = "Previewing top clip…";
+
+        // Meta
+        const meta = document.createElement('div');
+        meta.className = "meta";
+        meta.innerHTML = `
+          <div><strong>${clip.title || "Suggested Clip"}</strong></div>
+          <div>Segment: ${clip.start_time || "00:00:00"} → ${clip.end_time || "00:00:10"}</div>
+          ${clip.hook ? `<div>Hook: ${clip.hook}</div>` : ""}
+          ${clip.reason ? `<div>Reason: ${clip.reason}</div>` : ""}
+          ${typeof clip.viral_score === "number" ? `<div>Viral Score: ${clip.viral_score}</div>` : ""}
+          ${Array.isArray(clip.platforms) ? `<div>Platforms: ${clip.platforms.join(", ")}</div>` : ""}
+        `;
+        previewEl.appendChild(meta);
+
+        if (isYouTube(url)) {
+          // YouTube embed with start/end params
+          const id = getYouTubeId(url);
+          if (!id) {
+            statusEl.innerHTML = '<span class="error">Could not parse YouTube video ID.</span>';
+          } else {
+            const params = new URLSearchParams({
+              autoplay: "1",
+              controls: "1",
+              modestbranding: "1",
+              rel: "0",
+              start: String(start),
+              end: String(end)
+            });
+            const iframe = document.createElement('iframe');
+            iframe.src = `https://www.youtube.com/embed/${id}?${params.toString()}`;
+            iframe.allow = "autoplay; encrypted-media";
+            iframe.style.border = "0";
+            previewEl.appendChild(iframe);
+          }
+        } else {
+          // Direct MP4 or HTML5-playable URL
+          const video = document.createElement('video');
+          video.controls = true;
+          video.playsInline = true;
+          // Jump near start, then correct precisely
+          video.src = url.includes("#t=") ? url : `${url}#t=${start}`;
+          const onLoaded = () => { try { video.currentTime = start; } catch {} video.play().catch(()=>{}); };
+          const onTimeUpdate = () => { if (video.currentTime >= end) video.pause(); };
+          video.addEventListener("loadedmetadata", onLoaded);
+          video.addEventListener("timeupdate", onTimeUpdate);
+          previewEl.appendChild(video);
+        }
+
+        // Raw JSON for debugging (optional)
+        const pre = document.createElement('pre');
+        pre.textContent = JSON.stringify(clip, null, 2);
+        previewEl.appendChild(pre);
+
+      } catch (e) {
+        statusEl.innerHTML = `<span class="error">Request failed: ${e.message || e}</span>`;
+      } finally {
+        goBtn.disabled = false;
+      }
+    }
+  </script>
+</body>
+</html>
