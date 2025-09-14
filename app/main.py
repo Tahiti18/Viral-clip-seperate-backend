@@ -1,12 +1,12 @@
 import os, json, io, zipfile, urllib.request, urllib.error, time, re
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Tuple
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import asyncpg
 from pydantic import BaseModel
 
-app = FastAPI(title="UnityLab Backend", version="2.2.0-multiagent-safe")
+app = FastAPI(title="UnityLab Backend", version="2.3.1-multiagent-3clips")
 
 # ---------------- CORS ----------------
 app.add_middleware(
@@ -50,11 +50,9 @@ FENCE_RE = re.compile(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", re.IGNORECASE)
 def _extract_json_str(text: str) -> Optional[str]:
     if not text:
         return None
-    # Prefer ```json ...``` fenced block if present
     m = FENCE_RE.search(text)
     if m:
         return m.group(1).strip()
-    # Otherwise take first '{' .. last '}'
     a = text.find("{")
     b = text.rfind("}")
     if a != -1 and b != -1 and b > a:
@@ -80,10 +78,6 @@ def _openrouter_request(payload: Dict[str, Any]) -> Dict[str, Any]:
         return json.loads(resp.read().decode("utf-8"))
 
 def _ask_json(model: str, user_prompt: str, schema_hint: str, attempts: int = 2, max_tokens: int = 1200) -> Dict[str, Any]:
-    """
-    Ask a model for JSON; auto-repair if it returns prose.
-    Returns dict with keys: clips (list) and raw (preview of model output).
-    """
     last_text = ""
     for _ in range(attempts):
         payload = {
@@ -94,7 +88,7 @@ def _ask_json(model: str, user_prompt: str, schema_hint: str, attempts: int = 2,
             ],
             "max_tokens": max_tokens,
             "temperature": 0.2,
-            "response_format": {"type": "json_object"},  # honored by many providers
+            "response_format": {"type": "json_object"},
             "seed": 1
         }
         data = _openrouter_request(payload)
@@ -112,7 +106,6 @@ def _ask_json(model: str, user_prompt: str, schema_hint: str, attempts: int = 2,
             except Exception:
                 pass
 
-        # Repair prompt and retry
         user_prompt = (
             "The previous response was NOT valid JSON.\n"
             "Respond again with ONLY valid JSON that matches this schema: "
@@ -120,8 +113,55 @@ def _ask_json(model: str, user_prompt: str, schema_hint: str, attempts: int = 2,
             "Your previous output (truncated):\n" + last_text[:1000]
         )
         time.sleep(0.4)
-
     return {"clips": [], "raw": last_text[:1000]}
+
+# ---------------- Clip utilities ----------------
+def _hms_to_seconds(hms: str) -> int:
+    try:
+        hh, mm, ss = (hms or "00:00:00").split(":")
+        return int(hh) * 3600 + int(mm) * 60 + int(ss)
+    except Exception:
+        return 0
+
+def _normalize_clip(c: Dict[str, Any], idx: int) -> Dict[str, Any]:
+    st = c.get("start_time") or "00:00:00"
+    et = c.get("end_time") or "00:00:10"
+    dur = c.get("duration")
+    if not isinstance(dur, int):
+        dur = max(1, _hms_to_seconds(et) - _hms_to_seconds(st))
+    return {
+        "id": int(c.get("id") or (idx + 1)),
+        "start_time": st,
+        "end_time": et,
+        "duration": dur,
+        "viral_score": float(c.get("viral_score") or 0),
+        "hook": c.get("hook") or "",
+        "reason": c.get("reason") or "",
+        "title": c.get("title") or "",
+        "caption": c.get("caption") or "",
+        "platforms": c.get("platforms") or [],
+        "predicted_views": int(c.get("predicted_views") or 0),
+    }
+
+def _dedupe_by_times(clips: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen: set[Tuple[str,str]] = set()
+    out = []
+    for c in clips:
+        key = (c.get("start_time"), c.get("end_time"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(c)
+    return out
+
+def _enforce_three(best: List[Dict[str,Any]], fallbacks: List[List[Dict[str,Any]]]) -> List[Dict[str,Any]]:
+    merged: List[Dict[str,Any]] = [_normalize_clip(c,i) for i,c in enumerate(best)]
+    for fb in fallbacks:
+        for c in fb:
+            merged.append(_normalize_clip(c, len(merged)))
+    merged = _dedupe_by_times(merged)
+    merged.sort(key=lambda c: float(c.get("viral_score") or 0), reverse=True)
+    return merged[:3]
 
 # ---------------- Routes ----------------
 @app.get("/")
@@ -132,19 +172,28 @@ async def root():
 async def health():
     return {"ok": True}
 
-# ---------------- Multi-agent pipeline (strict JSON + retries) ----------------
+# >>> RESTORED: Railway health check route <<<
+@app.get("/api/ai-status")
+def ai_status_check():
+    key = os.getenv("OPENROUTER_API_KEY", "")
+    return {
+        "ai_status": "online",
+        "api_key_valid": bool(key and key.startswith("sk-or-")),
+        "model_default": os.getenv("FINAL_JUDGE_MODEL", "openai/gpt-5")
+    }
+
+# ---------------- Multi-agent pipeline ----------------
 @app.post("/api/analyze-video")
 async def analyze_video(job: JobIn):
     """
-    4-agent pipeline with strict JSON enforcement + retries at each stage.
-    Models (OpenRouter slugs):
-      - google/gemini-2.5-pro
-      - anthropic/claude-3.5-sonnet
-      - openai/gpt-5        (falls back to openai/gpt-4.1 if unavailable)
-      - openai/gpt-4.1
+    A -> Google Gemini 2.5 Pro: propose candidate spans
+    B -> Claude 3.5 Sonnet: enrich hooks & reasons
+    C -> OpenAI Judge (GPT-5, fallback GPT-4.1): select/refine top 3 & score
+    D -> GPT-4.1: package with titles, captions, platforms, predicted views
+    Always returns exactly 3 clips.
     """
     try:
-        # 1) GEMINI -> candidate spans
+        # 1) A: Candidate spans (Gemini)
         schema1 = '{"clips":[{"start_time":"HH:MM:SS","end_time":"HH:MM:SS","duration":45,"topic":"..."}]}'
         gemini_prompt = f"""Video URL: {job.video_url}
 Title: {job.title}
@@ -155,7 +204,7 @@ Return ONLY JSON matching: {schema1}
 """
         g = _ask_json("google/gemini-2.5-pro", gemini_prompt, schema1)
 
-        # 2) CLAUDE -> add hooks & reasons
+        # 2) B: Add hooks & reasons (Claude)
         schema2 = '{"clips":[{"start_time":"HH:MM:SS","end_time":"HH:MM:SS","duration":45,"topic":"...","hook":"...","reason":"..."}]}'
         claude_prompt = f"""Given this:
 {json.dumps({"clips": g["clips"]}, ensure_ascii=False)}
@@ -165,7 +214,7 @@ Return ONLY JSON matching: {schema2}
 """
         c = _ask_json("anthropic/claude-3.5-sonnet", claude_prompt, schema2)
 
-        # 3) GPT-5 (fallback to 4.1) -> pick strongest 3 and score
+        # 3) C: Judge & refine top 3 (GPT-5 -> fallback GPT-4.1)
         schema3 = '{"clips":[{"id":1,"start_time":"HH:MM:SS","end_time":"HH:MM:SS","duration":45,"viral_score":8.7,"hook":"...","reason":"..."}]}'
         judge_model = os.getenv("FINAL_JUDGE_MODEL", "openai/gpt-5") or "openai/gpt-5"
         judge_prompt = f"""Review these clips and return the BEST three with improved hook/reason and a "viral_score" 0–10.
@@ -183,9 +232,10 @@ Return ONLY JSON matching: {schema3}
             j = _ask_json("openai/gpt-4.1", judge_prompt, schema3)
             used_judge = "openai/gpt-4.1"
 
-        final3 = (j["clips"] or c["clips"] or g["clips"])[:3]
+        # Enforce exactly 3 BEFORE packaging
+        final3 = _enforce_three(j["clips"], [c["clips"], g["clips"]])
 
-        # 4) GPT-4.1 -> add title/caption/platforms/predicted_views
+        # 4) D: Package (GPT-4.1)
         schema4 = '{"clips":[{"id":1,"start_time":"HH:MM:SS","end_time":"HH:MM:SS","duration":45,"viral_score":8.7,"hook":"...","reason":"...","title":"...","caption":"...","platforms":["TikTok","Instagram"],"predicted_views":45000}]}'
         pack_prompt = f"""Enhance these with title, caption, platforms, predicted_views.
 Input:
@@ -194,23 +244,20 @@ Input:
 Return ONLY JSON matching: {schema4}
 """
         p = _ask_json("openai/gpt-4.1", pack_prompt, schema4)
-        clips = p["clips"]
+        packaged = _enforce_three(p["clips"], [final3])
+
+        for i, clip in enumerate(packaged, start=1):
+            clip["id"] = i
 
         return {
             "success": True,
             "video_url": job.video_url,
-            "clips": clips,
+            "clips": packaged,
             "agents": {
                 "A": "google/gemini-2.5-pro",
                 "B": "anthropic/claude-3.5-sonnet",
                 "C": used_judge,
                 "D": "openai/gpt-4.1",
-            },
-            "debug": {
-                "gemini_raw_preview": g["raw"][:300],
-                "claude_raw_preview": c["raw"][:300],
-                "judge_raw_preview": j["raw"][:300],
-                "packager_raw_preview": p["raw"][:300],
             },
         }
 
@@ -220,7 +267,7 @@ Return ONLY JSON matching: {schema4}
     except Exception as e:
         return {"success": False, "error": f"Pipeline failed: {str(e)}"}
 
-# ---------------- Optional: tiny handoff ZIP ----------------
+# ---------------- Optional handoff ZIP ----------------
 def _sample_srt() -> str:
     return (
         "1\n00:00:00,000 --> 00:00:02,000\nWelcome to UnityLab!\n\n"
