@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 app = FastAPI(title="UnityLab Backend", version="2.0.0-multiagent")
 
-# CORS
+# ---------------- CORS ----------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://clipgenius.netlify.app", "http://localhost:3000"],
@@ -17,7 +17,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------- DB helpers ----------
+# --------------- DB helpers ---------------
 def _conn_strings():
     dpsql = os.getenv("DATABASE_URL_PSQL", "")
     dasync = os.getenv("DATABASE_URL", "")
@@ -33,13 +33,13 @@ async def _pool():
         app.state.pool = await asyncpg.create_pool(dpsql, min_size=1, max_size=5)
     return app.state.pool
 
-# ---------- Schemas ----------
+# ---------------- Schemas ----------------
 class JobIn(BaseModel):
     video_url: str
     title: str
     description: str
 
-# ---------- Utility ----------
+# ----------- OpenRouter utility -----------
 def _call_openrouter(model: str, prompt: str, api_key: str, max_tokens: int = 1000) -> str:
     """Call OpenRouter with given model and prompt, return content string."""
     headers = {
@@ -62,13 +62,16 @@ def _call_openrouter(model: str, prompt: str, api_key: str, max_tokens: int = 10
         result = json.loads(resp.read().decode("utf-8"))
     return result["choices"][0]["message"]["content"]
 
-# ---------- Endpoints ----------
+# ---------------- Basic routes ----------------
 @app.get("/")
-async def root(): return {"ok": True}
+async def root():
+    return {"ok": True}
 
 @app.get("/health")
-async def health(): return {"ok": True}
+async def health():
+    return {"ok": True}
 
+# --------------- Multi-agent pipeline ---------------
 @app.post("/api/analyze-video")
 async def analyze_video(job: JobIn):
     try:
@@ -76,7 +79,7 @@ async def analyze_video(job: JobIn):
         if not api_key:
             return {"success": False, "error": "Missing OPENROUTER_API_KEY"}
 
-        # --- 1. Gemini: propose candidate clips ---
+        # --- 1) Gemini: propose candidate clips ---
         gemini_prompt = f"""
         Video URL: {job.video_url}
         Title: {job.title}
@@ -86,8 +89,8 @@ async def analyze_video(job: JobIn):
         Return JSON with `clips` containing start_time, end_time, duration, and rough topic.
         """
         gemini_out = _call_openrouter("google/gemini-1.5-pro", gemini_prompt, api_key)
-        
-        # --- 2. Claude: extract emotional hooks ---
+
+        # --- 2) Claude: extract emotional hooks ---
         claude_prompt = f"""
         Use this candidate clips JSON:
         {gemini_out}
@@ -99,7 +102,7 @@ async def analyze_video(job: JobIn):
         """
         claude_out = _call_openrouter("anthropic/claude-3.5-sonnet", claude_prompt, api_key)
 
-        # --- 3. GPT-5: refine & select top 3 clips ---
+        # --- 3) GPT-5: refine & select top 3 clips ---
         gpt5_prompt = f"""
         Review these annotated clips:
         {claude_out}
@@ -109,7 +112,7 @@ async def analyze_video(job: JobIn):
         """
         gpt5_out = _call_openrouter("openai/gpt-5", gpt5_prompt, api_key)
 
-        # --- 4. GPT-4.1: add titles, captions, platform predictions ---
+        # --- 4) GPT-4.1: titles, captions, platform predictions ---
         gpt41_prompt = f"""
         Take the final 3 clips:
         {gpt5_out}
@@ -123,7 +126,7 @@ async def analyze_video(job: JobIn):
         """
         gpt41_out = _call_openrouter("openai/gpt-4.1", gpt41_prompt, api_key)
 
-        # Try to parse JSON
+        # --- Parse final JSON safely ---
         try:
             start_idx = gpt41_out.find("{")
             end_idx = gpt41_out.rfind("}") + 1
@@ -144,5 +147,8 @@ async def analyze_video(job: JobIn):
             }
         }
 
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8") if hasattr(e, "read") else str(e)
+        return {"success": False, "error": f"Pipeline failed: HTTP Error {e.code}", "details": detail}
     except Exception as e:
         return {"success": False, "error": f"Pipeline failed: {str(e)}"}
