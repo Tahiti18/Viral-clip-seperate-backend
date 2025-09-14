@@ -1,6 +1,5 @@
 import os, json, io, zipfile
-import asyncio
-import aiohttp
+import requests
 from typing import Optional, Any, Dict
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -39,7 +38,7 @@ class OpenRouterClient:
         self.api_key = OPENROUTER_API_KEY
         self.base_url = OPENROUTER_BASE_URL
     
-    async def call_model(self, model: str, messages: list, temperature: float = 0.3):
+    def call_model(self, model: str, messages: list, temperature: float = 0.3):
         if not self.api_key:
             raise Exception("OPENROUTER_API_KEY environment variable not set")
             
@@ -58,14 +57,12 @@ class OpenRouterClient:
         }
         
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(self.base_url, headers=headers, json=payload) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        return result["choices"][0]["message"]["content"]
-                    else:
-                        error_text = await response.text()
-                        raise Exception(f"OpenRouter Error {response.status}: {error_text}")
+            response = requests.post(self.base_url, headers=headers, json=payload, timeout=60)
+            if response.status_code == 200:
+                result = response.json()
+                return result["choices"][0]["message"]["content"]
+            else:
+                raise Exception(f"OpenRouter Error {response.status_code}: {response.text}")
         except Exception as e:
             raise Exception(f"AI Client Error: {str(e)}")
 
@@ -145,7 +142,7 @@ Return ONLY valid JSON in this exact format:
         """
         
         messages = [{"role": "user", "content": content_prompt}]
-        content_analysis = await ai_client.call_model("openai/gpt-5", messages, temperature=0.3)
+        content_analysis = ai_client.call_model("openai/gpt-5", messages, temperature=0.3)
         
         # Step 2: Hook Generation with GPT-5
         hook_prompt = f"""
@@ -194,7 +191,7 @@ Return ONLY valid JSON:
         """
         
         messages = [{"role": "user", "content": hook_prompt}]
-        hooks_analysis = await ai_client.call_model("openai/gpt-5", messages, temperature=0.7)
+        hooks_analysis = ai_client.call_model("openai/gpt-5", messages, temperature=0.7)
         
         # Step 3: Platform Optimization
         platform_prompt = f"""
@@ -233,7 +230,7 @@ Return ONLY valid JSON:
         """
         
         messages = [{"role": "user", "content": platform_prompt}]
-        platform_strategy = await ai_client.call_model("openai/o4-mini", messages, temperature=0.4)
+        platform_strategy = ai_client.call_model("openai/o4-mini", messages, temperature=0.4)
         
         return {
             "success": True,
@@ -258,7 +255,7 @@ Return ONLY valid JSON:
         }
 
 @app.get("/api/ai-status")  
-async def check_ai_status():
+def check_ai_status():
     """
     Check if AI integration is working properly
     Tests GPT-5 connectivity and API key validity
@@ -274,7 +271,7 @@ async def check_ai_status():
             }
             
         test_messages = [{"role": "user", "content": "Respond with exactly 'AI systems operational' if you can process this message."}]
-        result = await ai_client.call_model("openai/gpt-5", test_messages)
+        result = ai_client.call_model("openai/gpt-5", test_messages)
         
         return {
             "ai_status": "online",
