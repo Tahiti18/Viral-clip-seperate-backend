@@ -1,4 +1,4 @@
-import os, json, io, zipfile, urllib.request, urllib.error, time, re
+import os, json, io, zipfile, urllib.request, urllib.error, time, re, subprocess
 from typing import Dict, Any, Optional, List, Tuple
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -172,7 +172,16 @@ async def root():
 async def health():
     return {"ok": True}
 
-# >>> RESTORED: Railway health check route <<<
+# FFmpeg availability check
+@app.get("/api/ffmpeg-check")
+def ffmpeg_check():
+    try:
+        out = subprocess.check_output(["ffmpeg", "-version"], stderr=subprocess.STDOUT, timeout=5)
+        return {"ok": True, "ffmpeg": out.decode("utf-8").splitlines()[0]}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+# Railway health check
 @app.get("/api/ai-status")
 def ai_status_check():
     key = os.getenv("OPENROUTER_API_KEY", "")
