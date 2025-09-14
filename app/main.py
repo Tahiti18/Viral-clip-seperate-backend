@@ -164,3 +164,14 @@ async def list_projects():
     pool = await _pool()
     rows = await pool.fetch("SELECT id, org_id, title, description, created_at FROM projects ORDER BY created_at DESC")
     return [dict(r) for r in rows]
+    # AI Status Check - Minimal Safe Addition
+@app.get("/api/ai-status")
+def ai_status_check():
+    try:
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        if api_key and len(api_key) > 20:
+            return {"ai_status": "online", "api_key_valid": True}
+        else:
+            return {"ai_status": "offline", "error": "No API key"}
+    except Exception as e:
+        return {"ai_status": "offline", "error": str(e)}
