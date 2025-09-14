@@ -1,4 +1,4 @@
-import os, json, io, zipfile, urllib.request, urllib.error, time, re, subprocess
+import os, json, io, zipfile, urllib.request, urllib.error, time, re
 from typing import Dict, Any, Optional, List, Tuple
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -6,7 +6,7 @@ from fastapi.responses import StreamingResponse
 import asyncpg
 from pydantic import BaseModel
 
-app = FastAPI(title="UnityLab Backend", version="2.3.1-multiagent-3clips")
+app = FastAPI(title="UnityLab Backend", version="2.3.2-multiagent-3clips-nodemo")
 
 # ---------------- CORS ----------------
 app.add_middleware(
@@ -172,16 +172,6 @@ async def root():
 async def health():
     return {"ok": True}
 
-# FFmpeg availability check
-@app.get("/api/ffmpeg-check")
-def ffmpeg_check():
-    try:
-        out = subprocess.check_output(["ffmpeg", "-version"], stderr=subprocess.STDOUT, timeout=5)
-        return {"ok": True, "ffmpeg": out.decode("utf-8").splitlines()[0]}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-# Railway health check
 @app.get("/api/ai-status")
 def ai_status_check():
     key = os.getenv("OPENROUTER_API_KEY", "")
@@ -194,15 +184,8 @@ def ai_status_check():
 # ---------------- Multi-agent pipeline ----------------
 @app.post("/api/analyze-video")
 async def analyze_video(job: JobIn):
-    """
-    A -> Google Gemini 2.5 Pro: propose candidate spans
-    B -> Claude 3.5 Sonnet: enrich hooks & reasons
-    C -> OpenAI Judge (GPT-5, fallback GPT-4.1): select/refine top 3 & score
-    D -> GPT-4.1: package with titles, captions, platforms, predicted views
-    Always returns exactly 3 clips.
-    """
     try:
-        # 1) A: Candidate spans (Gemini)
+        # 1) Gemini
         schema1 = '{"clips":[{"start_time":"HH:MM:SS","end_time":"HH:MM:SS","duration":45,"topic":"..."}]}'
         gemini_prompt = f"""Video URL: {job.video_url}
 Title: {job.title}
@@ -213,7 +196,7 @@ Return ONLY JSON matching: {schema1}
 """
         g = _ask_json("google/gemini-2.5-pro", gemini_prompt, schema1)
 
-        # 2) B: Add hooks & reasons (Claude)
+        # 2) Claude
         schema2 = '{"clips":[{"start_time":"HH:MM:SS","end_time":"HH:MM:SS","duration":45,"topic":"...","hook":"...","reason":"..."}]}'
         claude_prompt = f"""Given this:
 {json.dumps({"clips": g["clips"]}, ensure_ascii=False)}
@@ -223,7 +206,7 @@ Return ONLY JSON matching: {schema2}
 """
         c = _ask_json("anthropic/claude-3.5-sonnet", claude_prompt, schema2)
 
-        # 3) C: Judge & refine top 3 (GPT-5 -> fallback GPT-4.1)
+        # 3) Judge (GPT-5 fallback GPT-4.1)
         schema3 = '{"clips":[{"id":1,"start_time":"HH:MM:SS","end_time":"HH:MM:SS","duration":45,"viral_score":8.7,"hook":"...","reason":"..."}]}'
         judge_model = os.getenv("FINAL_JUDGE_MODEL", "openai/gpt-5") or "openai/gpt-5"
         judge_prompt = f"""Review these clips and return the BEST three with improved hook/reason and a "viral_score" 0–10.
@@ -241,10 +224,9 @@ Return ONLY JSON matching: {schema3}
             j = _ask_json("openai/gpt-4.1", judge_prompt, schema3)
             used_judge = "openai/gpt-4.1"
 
-        # Enforce exactly 3 BEFORE packaging
         final3 = _enforce_three(j["clips"], [c["clips"], g["clips"]])
 
-        # 4) D: Package (GPT-4.1)
+        # 4) Packager (GPT-4.1)
         schema4 = '{"clips":[{"id":1,"start_time":"HH:MM:SS","end_time":"HH:MM:SS","duration":45,"viral_score":8.7,"hook":"...","reason":"...","title":"...","caption":"...","platforms":["TikTok","Instagram"],"predicted_views":45000}]}'
         pack_prompt = f"""Enhance these with title, caption, platforms, predicted_views.
 Input:
@@ -268,6 +250,8 @@ Return ONLY JSON matching: {schema4}
                 "C": used_judge,
                 "D": "openai/gpt-4.1",
             },
+            "demo": False,                 # ensure UI doesn’t flag demo
+            "analysis_mode": "live"        # force live mode
         }
 
     except urllib.error.HTTPError as e:
