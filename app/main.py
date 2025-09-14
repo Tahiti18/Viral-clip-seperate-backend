@@ -288,7 +288,7 @@ async def analyze_video(request: dict):
             "success": True,
             "video_url": video_url,
             "clips": clips,
-            "ai_model": "gpt-5",
+            "ai_model": "openai/gpt-5",
             "processing_time": "Real AI Analysis",
             "demo_mode": False,
             "clips_suggested": len(clips)
