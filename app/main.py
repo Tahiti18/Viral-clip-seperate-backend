@@ -6,9 +6,8 @@ from fastapi.responses import StreamingResponse
 import asyncpg
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="UnityLab Backend", version="1.0.2")
+app = FastAPI(title="UnityLab Backend", version="1.0.3")
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://clipgenius.netlify.app", "http://localhost:3000"],
@@ -17,7 +16,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------- DB helpers ----------
 def _conn_strings():
     dpsql = os.getenv("DATABASE_URL_PSQL", "")
     dasync = os.getenv("DATABASE_URL", "")
@@ -33,7 +31,6 @@ async def _pool():
         app.state.pool = await asyncpg.create_pool(dpsql, min_size=1, max_size=5)
     return app.state.pool
 
-# ---------- Basics ----------
 @app.get("/")
 async def root(): return {"ok": True}
 
@@ -59,7 +56,6 @@ async def handoff_zip():
         headers={"Content-Disposition": 'attachment; filename="handoff.zip"', "Cache-Control": "no-store"},
     )
 
-# ---------- Schemas ----------
 class TemplateIn(BaseModel):
     name: str
     aspect: str = Field(pattern=r"^(9:16|1:1|16:9)$")
@@ -73,7 +69,6 @@ class JobIn(BaseModel):
     input_minutes: int = 5
     plan_id: str = "starter"
 
-# ---------- Template endpoints ----------
 @app.get("/api/templates")
 async def list_templates():
     pool = await _pool()
@@ -115,11 +110,10 @@ async def update_template(tid: str, body: Dict[str, Any]):
 
 @app.delete("/api/templates/{tid}")
 async def delete_template(tid: str):
-    pool = await __pool()
+    pool = await _pool()
     await pool.execute("DELETE FROM templates WHERE id=$1", tid)
     return {"ok": True}
 
-# ---------- Jobs / Media / Projects ----------
 @app.get("/api/jobs")
 async def list_jobs():
     pool = await _pool()
@@ -167,7 +161,6 @@ async def list_projects():
     rows = await pool.fetch("SELECT id, org_id, title, description, created_at FROM projects ORDER BY created_at DESC")
     return [dict(r) for r in rows]
 
-# ---------- AI status + debug ----------
 @app.get("/api/ai-status")
 def ai_status_check():
     try:
@@ -198,7 +191,6 @@ def debug_openrouter():
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# ---------- Analyze ----------
 @app.post("/api/analyze-video")
 async def analyze_video(request: dict):
     try:
@@ -234,11 +226,16 @@ async def analyze_video(request: dict):
             "max_tokens": 500
         }
 
-        req_data = json.dumps(data).encode("utf-8")
         req = urllib.request.Request(
             "https://openrouter.ai/api/v1/chat/completions",
-            data=req_data,
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            data=json.dumps(data).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                # REQUIRED when your key is locked to a Site URL:
+                "HTTP-Referer": "https://clipgenius.netlify.app",
+                "X-Title": "ClipGenius"
+            },
         )
 
         try:
@@ -252,8 +249,7 @@ async def analyze_video(request: dict):
         try:
             start_idx = ai_content.find("{")
             end_idx = ai_content.rfind("}") + 1
-            parsed = json.loads(ai_content[start_idx:end_idx])
-            clips = parsed.get("clips", [])
+            clips = json.loads(ai_content[start_idx:end_idx]).get("clips", [])
         except Exception:
             clips = [{
                 "id": 1, "start_time": "00:01:30", "end_time": "00:02:15", "duration": 45,
