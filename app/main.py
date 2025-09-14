@@ -1,11 +1,21 @@
 import os, json, io, zipfile
 from typing import Optional, Any, Dict
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 import asyncpg
 from pydantic import BaseModel, Field
 
 app = FastAPI(title="UnityLab Backend", version="1.0.0")
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://clipgenius.netlify.app", "http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 def _conn_strings():
     dpsql = os.getenv("DATABASE_URL_PSQL", "")
