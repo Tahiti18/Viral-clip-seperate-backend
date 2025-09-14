@@ -1,13 +1,14 @@
-import os, json, io, zipfile, urllib.request, urllib.error
+import os, json, io, zipfile, urllib.request, urllib.error, time
 from typing import Optional, Any, Dict
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import asyncpg
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="UnityLab Backend", version="1.0.3")
+app = FastAPI(title="UnityLab Backend", version="1.0.4-debug")
 
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://clipgenius.netlify.app", "http://localhost:3000"],
@@ -16,6 +17,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------- DB helpers ----------
 def _conn_strings():
     dpsql = os.getenv("DATABASE_URL_PSQL", "")
     dasync = os.getenv("DATABASE_URL", "")
@@ -31,6 +33,7 @@ async def _pool():
         app.state.pool = await asyncpg.create_pool(dpsql, min_size=1, max_size=5)
     return app.state.pool
 
+# ---------- Basics ----------
 @app.get("/")
 async def root(): return {"ok": True}
 
@@ -56,6 +59,7 @@ async def handoff_zip():
         headers={"Content-Disposition": 'attachment; filename="handoff.zip"', "Cache-Control": "no-store"},
     )
 
+# ---------- Schemas ----------
 class TemplateIn(BaseModel):
     name: str
     aspect: str = Field(pattern=r"^(9:16|1:1|16:9)$")
@@ -69,6 +73,7 @@ class JobIn(BaseModel):
     input_minutes: int = 5
     plan_id: str = "starter"
 
+# ---------- Template endpoints ----------
 @app.get("/api/templates")
 async def list_templates():
     pool = await _pool()
@@ -114,6 +119,7 @@ async def delete_template(tid: str):
     await pool.execute("DELETE FROM templates WHERE id=$1", tid)
     return {"ok": True}
 
+# ---------- Jobs / Media / Projects ----------
 @app.get("/api/jobs")
 async def list_jobs():
     pool = await _pool()
@@ -161,6 +167,7 @@ async def list_projects():
     rows = await pool.fetch("SELECT id, org_id, title, description, created_at FROM projects ORDER BY created_at DESC")
     return [dict(r) for r in rows]
 
+# ---------- AI status + debug ----------
 @app.get("/api/ai-status")
 def ai_status_check():
     try:
@@ -191,18 +198,19 @@ def debug_openrouter():
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+# ---------- Analyze (with masked header logging) ----------
 @app.post("/api/analyze-video")
 async def analyze_video(request: dict):
     try:
-        api_key = os.getenv("OPENROUTER_API_KEY")
+        api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
         if not api_key:
-            return {"error": "API key missing", "success": False}
+            return {"success": False, "error": "API key missing"}
 
         video_url = request.get("video_url", "")
         title = request.get("title", "")
         description = request.get("description", "")
         if not video_url:
-            return {"error": "Video URL required", "success": False}
+            return {"success": False, "error": "Video URL required"}
 
         prompt = f"""
         Analyze this video for viral clip potential:
@@ -220,30 +228,55 @@ async def analyze_video(request: dict):
         }}
         """
 
-        data = {
-            "model": "openai/gpt-4o-mini",
+        model_id = os.getenv("MODEL_ID", "openai/gpt-4o-mini").strip()
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            # IMPORTANT if key is locked to site; harmless otherwise:
+            "HTTP-Referer": "https://clipgenius.netlify.app",
+            "X-Title": "ClipGenius",
+        }
+
+        payload = {
+            "model": model_id,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": 500
         }
 
+        # Masked header preview for logs/response
+        masked_key = api_key[:6] + "…" + api_key[-4:] if len(api_key) > 10 else "***"
+        header_debug = {
+            "Authorization": f"Bearer {masked_key}",
+            "Content-Type": headers["Content-Type"],
+            "HTTP-Referer": headers.get("HTTP-Referer"),
+            "X-Title": headers.get("X-Title"),
+            "Model": model_id
+        }
+        print(f"[OpenRouter DEBUG] headers={header_debug}")
+
         req = urllib.request.Request(
             "https://openrouter.ai/api/v1/chat/completions",
-            data=json.dumps(data).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-                # REQUIRED when your key is locked to a Site URL:
-                "HTTP-Referer": "https://clipgenius.netlify.app",
-                "X-Title": "ClipGenius"
-            },
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
         )
 
+        t0 = time.time()
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:
-                result = json.loads(resp.read().decode("utf-8"))
+                raw = resp.read().decode("utf-8")
+                result = json.loads(raw)
+                latency_ms = int((time.time() - t0) * 1000)
+                print(f"[OpenRouter DEBUG] status=200 latency_ms={latency_ms}")
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8")[:500]
-            return {"success": False, "error": f"OpenRouter error {e.code}", "details": body}
+            print(f"[OpenRouter DEBUG] status={e.code} body={body}")
+            return {
+                "success": False,
+                "error": f"OpenRouter error {e.code}",
+                "details": body,
+                "debug_headers": header_debug
+            }
 
         ai_content = result["choices"][0]["message"]["content"]
         try:
@@ -262,10 +295,11 @@ async def analyze_video(request: dict):
             "success": True,
             "video_url": video_url,
             "clips": clips,
-            "ai_model": "openai/gpt-4o-mini",
-            "processing_time": "Real AI Analysis",
+            "ai_model": model_id,
+            "processing_time_ms": latency_ms,
             "demo_mode": False,
-            "clips_suggested": len(clips)
+            "clips_suggested": len(clips),
+            "debug_headers": header_debug
         }
     except Exception as e:
-        return {"error": f"Analysis failed: {str(e)}", "success": False}
+        return {"success": False, "error": f"Analysis failed: {str(e)}"}
