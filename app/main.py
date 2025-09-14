@@ -1,13 +1,12 @@
-# main.py
-import os, json, io, zipfile, urllib.request, urllib.error, time, re
+import os, json, io, zipfile, urllib.request, urllib.error, time, re, hashlib, subprocess, shlex, pathlib
 from typing import Dict, Any, Optional, List, Tuple
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 import asyncpg
 from pydantic import BaseModel
 
-app = FastAPI(title="UnityLab Backend", version="2.4.0-multiagent-strict-metrics")
+app = FastAPI(title="UnityLab Backend", version="2.5.0-preview-export")
 
 # ---------------- CORS ----------------
 app.add_middleware(
@@ -79,10 +78,6 @@ def _openrouter_request(payload: Dict[str, Any]) -> Dict[str, Any]:
         return json.loads(resp.read().decode("utf-8"))
 
 def _ask_json(model: str, user_prompt: str, schema_hint: str, attempts: int = 2, max_tokens: int = 1200) -> Dict[str, Any]:
-    """
-    Ask a model for JSON. If missing required keys per schema, retry once.
-    Returns dict with keys: clips (list), raw (preview text).
-    """
     last_text = ""
     for _ in range(attempts):
         payload = {
@@ -111,7 +106,6 @@ def _ask_json(model: str, user_prompt: str, schema_hint: str, attempts: int = 2,
             except Exception:
                 pass
 
-        # Retry with stricter wording
         user_prompt = (
             "The previous response was NOT valid JSON or missed required keys.\n"
             "Respond again with ONLY valid JSON that matches this schema exactly: "
@@ -171,7 +165,7 @@ def _enforce_three(best: List[Dict[str,Any]], fallbacks: List[List[Dict[str,Any]
     merged.sort(key=lambda c: float(c.get("viral_score") or 0), reverse=True)
     return merged[:3]
 
-# ---------------- Routes ----------------
+# ---------------- Simple status routes ----------------
 @app.get("/")
 async def root():
     return {"ok": True}
@@ -189,19 +183,17 @@ def ai_status_check():
         "model_default": os.getenv("FINAL_JUDGE_MODEL", "openai/gpt-5")
     }
 
-# ---------------- Multi-agent pipeline (strict metrics) ----------------
+# ---------------- Multi-agent analysis ----------------
 @app.post("/api/analyze-video")
 async def analyze_video(job: JobIn):
     """
     A -> Google Gemini 2.5 Pro: propose candidate spans
     B -> Claude 3.5 Sonnet: add hooks & reasons
     C -> Judge (GPT-5 or fallback 4.1): select/refine top 3 & score
-    D -> GPT-4.1: add title, caption, platforms, and REQUIRED metrics:
-         predicted_views, predicted_likes, predicted_shares
-    Always returns 3 clips (or best effort from earlier stages).
+    D -> GPT-4.1: add title, caption, platforms, and required metrics
     """
     try:
-        # 1) A: Candidate spans (Gemini)
+        # 1) A
         schema1 = '{"clips":[{"start_time":"HH:MM:SS","end_time":"HH:MM:SS","duration":45,"topic":"..."}]}'
         gemini_prompt = f"""Video URL: {job.video_url}
 Title: {job.title}
@@ -212,7 +204,7 @@ Return ONLY JSON matching: {schema1}
 """
         g = _ask_json("google/gemini-2.5-pro", gemini_prompt, schema1)
 
-        # 2) B: Add hooks & reasons (Claude)
+        # 2) B
         schema2 = '{"clips":[{"start_time":"HH:MM:SS","end_time":"HH:MM:SS","duration":45,"topic":"...","hook":"...","reason":"..."}]}'
         claude_prompt = f"""Given this:
 {json.dumps({"clips": g["clips"]}, ensure_ascii=False)}
@@ -222,7 +214,7 @@ Return ONLY JSON matching: {schema2}
 """
         c = _ask_json("anthropic/claude-3.5-sonnet", claude_prompt, schema2)
 
-        # 3) C: Judge & refine top 3 (GPT-5 -> fallback 4.1)
+        # 3) C
         schema3 = '{"clips":[{"id":1,"start_time":"HH:MM:SS","end_time":"HH:MM:SS","duration":45,"viral_score":8.7,"hook":"...","reason":"..."}]}'
         judge_model = os.getenv("FINAL_JUDGE_MODEL", "openai/gpt-5") or "openai/gpt-5"
         judge_prompt = f"""Review these clips and return the BEST three with improved "hook" and "reason" plus a "viral_score" (0–10).
@@ -240,10 +232,9 @@ Return ONLY JSON matching: {schema3}
             j = _ask_json("openai/gpt-4.1", judge_prompt, schema3)
             used_judge = "openai/gpt-4.1"
 
-        # Ensure 3 clips before packaging
         final3 = _enforce_three(j["clips"], [c["clips"], g["clips"]])
 
-        # 4) D: Package (GPT-4.1) — STRICT metrics required
+        # 4) D (strict metrics)
         schema4 = (
             '{"clips":[{'
             '"id":1,'
@@ -268,32 +259,18 @@ Input:
 {json.dumps({"clips": final3}, ensure_ascii=False)}
 """
         p = _ask_json("openai/gpt-4.1", pack_prompt, schema4)
-
-        # Validate presence of required metrics; if missing, force a second pass once
-        def _has_metrics(clip: Dict[str, Any]) -> bool:
-            return all(k in clip for k in ("predicted_views", "predicted_likes", "predicted_shares"))
-
-        if not p["clips"] or not all(_has_metrics(c) for c in p["clips"]):
-            # one forced retry with even stricter wording
+        if not p["clips"] or not all(set(("predicted_views","predicted_likes","predicted_shares")).issubset(set(c.keys())) for c in p["clips"]):
             strict_prompt = pack_prompt + "\nALL THREE metrics are REQUIRED and must be integers on every clip."
             p = _ask_json("openai/gpt-4.1", strict_prompt, schema4)
 
         packaged = _enforce_three(p["clips"] or final3, [final3])
-
-        # Final tidy & ids
-        for i, clip in enumerate(packaged, start=1):
-            clip["id"] = i
+        for i, clip in enumerate(packaged, start=1): clip["id"] = i
 
         return {
             "success": True,
             "video_url": job.video_url,
             "clips": packaged,
-            "agents": {
-                "A": "google/gemini-2.5-pro",
-                "B": "anthropic/claude-3.5-sonnet",
-                "C": used_judge,
-                "D": "openai/gpt-4.1",
-            },
+            "agents": {"A":"google/gemini-2.5-pro","B":"anthropic/claude-3.5-sonnet","C":used_judge,"D":"openai/gpt-4.1"},
         }
 
     except urllib.error.HTTPError as e:
@@ -301,6 +278,116 @@ Input:
         return {"success": False, "error": f"HTTP Error {e.code}", "details": detail}
     except Exception as e:
         return {"success": False, "error": f"Pipeline failed: {str(e)}"}
+
+# ---------------- Real preview generation ----------------
+TMP_DIR = "/tmp/clipgenius"
+pathlib.Path(TMP_DIR).mkdir(parents=True, exist_ok=True)
+
+def _hash(s: str) -> str:
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()[:16]
+
+def _ensure_binary(name: str) -> None:
+    if not shutil.which(name):
+        raise RuntimeError(f"Required binary not found: {name}")
+
+def _download_source(video_url: str) -> str:
+    """
+    Returns a local mp4 path for the source video.
+    - Direct .mp4: downloaded via urllib (once & cached)
+    - YouTube/others: via yt-dlp (best mp4), cached by URL hash
+    """
+    os.makedirs(TMP_DIR, exist_ok=True)
+    h = _hash(video_url)
+    dst = os.path.join(TMP_DIR, f"{h}.mp4")
+    if os.path.exists(dst) and os.path.getsize(dst) > 0:
+        return dst
+
+    # If it's a direct mp4, just fetch
+    if video_url.lower().endswith(".mp4"):
+        req = urllib.request.Request(video_url, headers={"User-Agent":"Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=120) as r, open(dst, "wb") as f:
+            f.write(r.read())
+        return dst
+
+    # Otherwise, use yt-dlp
+    import yt_dlp  # ensure in requirements.txt
+    ydl_opts = {
+        "outtmpl": os.path.join(TMP_DIR, f"{h}.%(ext)s"),
+        "format": "mp4/best",
+        "quiet": True,
+        "no_warnings": True,
+        "retries": 3,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(video_url, download=True)
+        downloaded = ydl.prepare_filename(info)
+    # Normalize extension to .mp4 if needed
+    if downloaded.endswith(".mp4"):
+        os.rename(downloaded, dst)
+        return dst
+    else:
+        # Convert to mp4
+        tmp_mp4 = os.path.join(TMP_DIR, f"{h}.mp4")
+        _ffmpeg_copy(downloaded, tmp_mp4)
+        return tmp_mp4
+
+def _ffmpeg_trim(src: str, start_s: int, end_s: int, out_path: str) -> None:
+    """
+    Trim clip [start_s, end_s) with re-encode for browser safety.
+    """
+    duration = max(1, end_s - start_s)
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", str(start_s),
+        "-i", src,
+        "-t", str(duration),
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
+        out_path,
+    ]
+    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+def _ffmpeg_copy(src: str, out_path: str) -> None:
+    cmd = ["ffmpeg", "-y", "-i", src, "-c", "copy", out_path]
+    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+@app.get("/api/preview")
+def preview_clip(
+    video_url: str = Query(..., description="YouTube URL or direct MP4"),
+    start_time: str = Query(..., description="HH:MM:SS"),
+    end_time: str = Query(..., description="HH:MM:SS"),
+):
+    """
+    Stream a real clipped MP4 for instant preview in the UI.
+    Example:
+      /api/preview?video_url=...&start_time=00:01:15&end_time=00:02:00
+    """
+    try:
+        start_s = _hms_to_seconds(start_time)
+        end_s = _hms_to_seconds(end_time)
+        if end_s <= start_s:
+            return JSONResponse({"ok": False, "error": "end_time must be > start_time"}, status_code=400)
+
+        src = _download_source(video_url)
+        h = _hash(f"{src}-{start_s}-{end_s}")
+        out_path = os.path.join(TMP_DIR, f"clip-{h}.mp4")
+        if not os.path.exists(out_path):
+            _ffmpeg_trim(src, start_s, end_s, out_path)
+
+        headers = {
+            "Cache-Control": "no-store",
+            "Content-Disposition": 'inline; filename="preview.mp4"',
+            "Access-Control-Expose-Headers": "Content-Disposition",
+        }
+        return FileResponse(out_path, media_type="video/mp4", headers=headers)
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8") if hasattr(e, "read") else str(e)
+        return JSONResponse({"ok": False, "error": f"HTTP Error {e.code}", "details": detail}, status_code=502)
+    except subprocess.CalledProcessError as e:
+        return JSONResponse({"ok": False, "error": "ffmpeg failed", "details": e.stderr.decode("utf-8", "ignore")[:800]}, status_code=500)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 # ---------------- Optional handoff ZIP ----------------
 def _sample_srt() -> str:
@@ -319,8 +406,5 @@ async def handoff_zip():
     return StreamingResponse(
         buf,
         media_type="application/zip",
-        headers={
-            "Content-Disposition": 'attachment; filename="handoff.zip"',
-            "Cache-Control": "no-store",
-        },
+        headers={"Content-Disposition": 'attachment; filename="handoff.zip"', "Cache-Control": "no-store"},
     )
